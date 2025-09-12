@@ -18,8 +18,20 @@ from huggingface_hub.utils import (
     HfHubHTTPError,
 )
 
+import inspect
+
 logger = logging.getLogger("hub_downloader")
 
+def _supports_kwarg(func, name: str) -> bool:
+    """Retorna True se a função `func` aceitar o parâmetro nomeado `name`."""
+    try:
+        sig = inspect.signature(func)
+        return any(p.kind in (p.KEYWORD_ONLY, p.POSITIONAL_OR_KEYWORD) and p.name == name
+                   for p in sig.parameters.values())
+    except Exception:
+        # Em caso de ambiente sem introspecção confiável, seja conservador
+        return False
+    
 # ----------------------------- Utilidades CLI ----------------------------- #
 def _flatten_patterns(values: Optional[List[str]]) -> Optional[List[str]]:
     """
@@ -64,7 +76,7 @@ def download_model(
         ignore_patterns: Padrões a ignorar (["*.bin", ...]).
         revision: Branch/tag/commit (ex.: "main" ou SHA).
         max_workers: Paralelismo de downloads.
-        offline: True para modo offline (respeita HUGGINGFACE_HUB_OFFLINE).
+        offline: True/False para modo offline; None = respeita a configuração do ambiente.
         local_dir_use_symlinks: True usa symlinks (bom em Linux para economizar disco).
 
     Retorna:
@@ -86,18 +98,37 @@ def download_model(
         f", destino='{local_dir}'" if local_dir else " (cache HF)",
     )
 
+    # Monta kwargs independentes de versão
+    common_kwargs = dict(
+        repo_id=repo_id,
+        revision=revision,
+        local_dir=str(local_dir) if local_dir else None,
+        local_dir_use_symlinks=local_dir_use_symlinks,
+        token=resolved_token,
+        allow_patterns=list(allow_patterns) if allow_patterns else None,
+        ignore_patterns=list(ignore_patterns) if ignore_patterns else None,
+        max_workers=max_workers,
+    )
+
     try:
-        downloaded_path = snapshot_download(
-            repo_id=repo_id,
-            revision=revision,
-            local_dir=str(local_dir) if local_dir else None,
-            local_dir_use_symlinks=local_dir_use_symlinks,
-            token=resolved_token,
-            allow_patterns=list(allow_patterns) if allow_patterns else None,
-            ignore_patterns=list(ignore_patterns) if ignore_patterns else None,
-            max_workers=max_workers,
-            offline=offline,
-        )
+        # Caminho 1: versões novas (aceitam `offline`)
+        if _supports_kwarg(snapshot_download, "offline"):
+            if offline is None:
+                downloaded_path = snapshot_download(**common_kwargs)
+            else:
+                downloaded_path = snapshot_download(**common_kwargs, offline=offline)
+
+        # Caminho 2: versões antigas (usar `local_files_only`)
+        else:
+            # None = não força; True/False = define explicitamente
+            if offline is None:
+                downloaded_path = snapshot_download(**common_kwargs)
+            else:
+                downloaded_path = snapshot_download(
+                    **common_kwargs,
+                    local_files_only=bool(offline)
+                )
+
         final_path = Path(downloaded_path).resolve()
         logger.info("Download concluído em: %s", final_path)
         return final_path
@@ -114,11 +145,24 @@ def download_model(
     except HfHubHTTPError as e:
         logger.error("Erro HTTP ao acessar o Hub: %s", e)
         raise
+    except TypeError as e:
+        # Fallback adicional: se algum kwargs não existir nessa versão, loga e tenta minimalista
+        logger.warning("TypeError detectado (%s). Tentando fallback minimalista…", e)
+        minimal_kwargs = {
+            k: v for k, v in common_kwargs.items()
+            if k in {"repo_id", "revision", "local_dir", "local_dir_use_symlinks",
+                     "token", "allow_patterns", "ignore_patterns", "max_workers"}
+        }
+        if offline is not None:
+            minimal_kwargs["local_files_only"] = bool(offline)
+        downloaded_path = snapshot_download(**minimal_kwargs)
+        final_path = Path(downloaded_path).resolve()
+        logger.info("Download concluído (fallback) em: %s", final_path)
+        return final_path
     except Exception:
         logger.exception("Falha inesperada ao baixar '%s'.", repo_id)
         raise
-
-
+    
 # ----------------------------- Entrypoint CLI ----------------------------- #
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
